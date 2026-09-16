@@ -81,11 +81,20 @@ def slice_references(body: str) -> tuple[str, bool]:
     return tail, True
 
 
-ENTRY_RE = re.compile(r"^\s*(?:\[?\d{1,3}\]?[.)]?[\s\u3000]|\(\d{1,3}\)[\s\u3000]|\d{1,3}\s*$)")
+# 兼容四种编号样式：`1. ` / `1) ` / `[1] ` / `[1]Author`（方括号后不空格的 EndNote 式）
+ENTRY_RE = re.compile(r"^\s*(?:\[\d{1,3}\]\s*[A-Z\u4e00-\u9fff]|\(\d{1,3}\)\s|\[?\d{1,3}\]?[.)]\s)")
 
 
 def count_entries(refs: str) -> int:
-    """启发式统计参考文献条目总数（用于给出与'带DOI数'对比的分母）。"""
+    """启发式统计参考文献条目总数（用于给出与"带DOI数"对比的分母）。
+
+    直接复用切分器 —— 按行数会把"段落从中间断开"的条目算成两条
+    （实测 M1 的 [9] 就被 docx 段落切成两行），按编号个数又会漏掉无编号条目。
+    """
+    flat = _flatten(refs)
+    parts = split_entries(refs)
+    if len(parts) >= 5:
+        return len(parts)
     lines = [l for l in refs.splitlines() if l.strip()]
     numbered = sum(1 for l in lines if ENTRY_RE.match(l))
     return numbered if numbered >= 5 else len(lines)
@@ -193,36 +202,103 @@ def _clean_doi(raw: str) -> str:
     return d.lower()
 
 
-NUM_SPLIT_RE = re.compile(r"(?=\b\d{1,3}\.\s+[A-Z])")
+# 条目切分：两套边界，按 REFERENCES 的实际编号样式自动选择
+#
+# 坑 3（2026-09-16 实测新增）：EndNote 导出的 `[1]Author...` 式条目，
+# 页码会被误当条目号 —— "8(6): 585-596. DOI: 10.1016/..." 里的 "596. D"
+# 命中了 `\d{1,3}\.\s+[A-Z]`，于是在条目中间断开，DOI 拿到了上一条的尾巴，
+# 反过来把下一条的题名塞给本条，造成整批假阳性（M1 实测被报成 28.6%）。
+#
+# 坑 4：把"编号后必须是大写字母"收紧也不行 —— 会漏掉 "9. de Oliveira"、
+# "9. van der Berg" 这类小写起首的姓，而且 "COVID-19. AJPM Focus…" 里的
+# "19. A" 反而会被当成编号，把第 18 条劈成两半。
+#
+# 正解（两层过滤）：
+#   ① 数字前不能紧跟字母/数字/连字符 —— 一步排除 "COVID-19." "585-596."
+#      "e28353." "100434." 这类页码、编号、卷期号的尾巴；
+#   ② 参考文献编号是连续的，只保留能构成 1→N 递增序列的那一组候选点。
+_NUM_CAND_RE = re.compile(r"(?<![0-9A-Za-z.\-])(\d{1,3})\.\s+")
+BRACKET_SPLIT_RE = re.compile(r"(?=\[\d{1,3}\]\s*[A-Za-z\u4e00-\u9fff])")
+
+
+def _split_numbered(flat: str) -> list[str]:
+    """按 1→N 递增序列挑出真正的条目边界（见上方坑 4）。"""
+    cands = [(m.start(1), int(m.group(1))) for m in _NUM_CAND_RE.finditer(flat)]
+    if not cands:
+        return [flat]
+
+    best: list[tuple[int, int]] = []
+    for si in range(len(cands)):
+        chain = [cands[si]]
+        expect = cands[si][1] + 1
+        for pos2, num2 in cands[si + 1:]:
+            if num2 == expect:
+                chain.append((pos2, num2))
+                expect += 1
+        if len(chain) > len(best):
+            best = chain
+
+    if len(best) < 3:
+        return [flat]
+    parts, prev = [], 0
+    for pos, _ in best:
+        parts.append(flat[prev:pos])
+        prev = pos
+    parts.append(flat[prev:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def split_entries(refs: str) -> list[str]:
+    """按编号样式切条目。三种样式依次尝试：
+
+    ① 方括号编号 `[1]Author`（EndNote 导出，最可靠）
+    ② 递增编号链 `1. Author` / `2. Author`（Vancouver 式）
+    ③ 换行（APA 式，条目之间只有段落边界）
+    """
+    flat = _flatten(refs)
+    if sum(1 for _ in BRACKET_SPLIT_RE.finditer(flat)) >= 3:
+        return [p.strip() for p in BRACKET_SPLIT_RE.split(flat) if p.strip()]
+    numbered = _split_numbered(flat)
+    if len(numbered) >= 3:
+        return numbered
+    lines = [l.strip() for l in refs.replace("ADDIN EN.REFLIST", "").splitlines() if l.strip()]
+    return lines if len(lines) >= 3 else [flat]
+
+
+def _flatten(refs: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"ADDIN\s+EN\.REFLIST", " ", refs))
 
 
 def build_entries(refs: str) -> dict[str, str]:
     """给每个 DOI 配它的**完整引文条目**文本。
 
-    踩过的两个坑：
+    踩过的坑：
     1) 不能按行切 —— docx 段落切分常把题名和 DOI 分到不同行；
     2) 也不能按"DOI 前 N 个字符"取窗口 —— 题名长时窗口会截到上一条的尾巴，
-       造成大量假阳性 MISMATCH（实测 M2 整篇被误报成 100%）。
-    正解：压平后按编号边界（"12. "）切条目，再把无 DOI 的碎片并入前一条。
+       造成大量假阳性 MISMATCH（实测 M2 整篇被误报成 100%）；
+    3) 编号边界本身会踩雷 —— 页码 "585-596. DOI:"、题名里的 "COVID-19. AJPM"
+       都会被误当条目号，把真条目劈开，见 _NUM_CAND_RE 上方注释。
+    正解：先识别编号样式，再按对应边界切条目，最后把无 DOI 的短碎片并回上一条。
     """
-    flat = re.sub(r"\s+", " ", refs)
+    parts = split_entries(refs)
 
-    parts = [p.strip() for p in NUM_SPLIT_RE.split(flat) if p.strip()]
-    if len(parts) < 3:
-        parts = [flat]
     merged: list[str] = []
     for p in parts:
         if DOI_RE.search(p) or not merged:
             merged.append(p)
-        else:
+        elif len(p) < 160:
+            # 短小无 DOI 碎片：多半是本条被意外切断的尾巴，并回上一条
             merged[-1] = merged[-1] + " " + p
+        # 长且无 DOI 的片段 = 真·无 DOI 条目，无法核验；
+        # 并入上一条只会往里灌别人的题名词，反而把真 MISMATCH 冲成 MATCH，故丢弃
 
     entries: dict[str, str] = {}
     for p in merged:
         for m in DOI_RE.finditer(p):
             entries.setdefault(_clean_doi(m.group(0)), p)
 
-    # 兜底：编号切分失败时用位置窗口，保证每个 DOI 都有上下文
+    # 兜底：切分异常时用位置窗口，保证每个 DOI 都有上下文
+    flat = _flatten(refs)
     for m in DOI_RE.finditer(flat):
         d = _clean_doi(m.group(0))
         if d not in entries:
