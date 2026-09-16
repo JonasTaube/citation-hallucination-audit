@@ -1,0 +1,19 @@
+# audit cache produced at runtime
+.citation_audit_cache.json
+scripts/.citation_audit_cache.json
+
+# generated reports
+audit_reports/
+*.report.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / os
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
